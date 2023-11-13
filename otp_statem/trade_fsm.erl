@@ -66,6 +66,8 @@ do_commit(OtherPid) ->
 notify_cancel(OtherPid) ->
   gen_fsm:send_all_state_event(OtherPid, cancel).
 
+init(Name) ->
+  {ok, idle, #state{name=Name}}.
 notice(#state{name = N}, Str, Args) ->
   io:format("~s: " ++ Str ++ "~n", [N | Args]).
 
