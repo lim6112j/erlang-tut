@@ -1,4 +1,3 @@
-
 -module(trade_fsm).
 
 -behaviour(gen_fsm).
@@ -16,14 +15,14 @@ start(Name) ->
 
 start_link(Name) ->
   gen_fsm:start_link(?MODULE, [Name], []).
+trade(OwnPid, OtherPid) ->
+  gen_fsm:sync_send_event ( OwnPid , { negotiate , OtherPid } , 30000 ).
 
-gen_fsm : sync_send_event ( OwnPid , { negotiate , OtherPid } , 30000 ) .
+accept_trade(OwnPid) ->
+gen_fsm : sync_send_event ( OwnPid , accept_negotiate ).
 
-gen_fsm : sync_send_event ( OwnPid , { negotiate , OtherPid } , 30000 ) .
-
-gen_fsm : sync_send_event ( OwnPid , accept_negotiate ) .
-
-make_offer ( OwnPid , Item ) -> make_offer ( OwnPid , Item ) -> gen_fsm : send_event ( OwnPid , { make_offer , Item } ) .
+make_offer ( OwnPid , Item ) -> 
+  gen_fsm:send_event ( OwnPid , { make_offer , Item } ).
 
 retract_offer(OwnPid, Item) ->
   gen_fsm:send_event(OwnPid, {retract_offer, Item}).
@@ -31,7 +30,11 @@ retract_offer(OwnPid, Item) ->
 ready(OwnPid) ->
   gen_fsm:sync_send_event(OwnPid, ready, infinity).
 
-cancel ( OwnPid ) -> ask_negotiate ( OtherPid , OwnPid ) -> ask_negotiate ( OtherPid , OwnPid ) -> gen_fsm : send_event ( OtherPid , { ask_negotiate , OwnPid } ) .
+cancel ( OwnPid ) -> 
+  gen_fsm:sync_send_all_state_event (OwnPid, cancel).
+
+ask_negotiate(OtherPid, OwnPid) ->
+  gen_fsm:send_event(OtherPid, {ask_negotiate, OwnPid}).
 
 accept_negotiate(OtherPid, OwnPid) ->
   gen_fsm:send_event(OtherPid, {accept_negotiate, OwnPid}).
@@ -63,8 +66,6 @@ do_commit(OtherPid) ->
 notify_cancel(OtherPid) ->
   gen_fsm:send_all_state_event(OtherPid, cancel).
 
-{ ok , idle , # state { name = Name } } .
-
 notice(#state{name = N}, Str, Args) ->
   io:format("~s: " ++ Str ++ "~n", [N | Args]).
 
@@ -91,9 +92,19 @@ idle({negotiate, OtherPid}, From, S = #state{}) ->
 idle(Event, _From, Data) ->
   unexpected(Event, idle),
   {next_state, idle, Data}.
-
-[ Item | Items ] .
-
+idle_wait({ask_negotiate, OtherPid}, S=#state{other=OtherPid}) ->
+  gen_fsm:reply(S#state.from, ok),
+  notice(S, "starting negotiation", []),
+  {next_state, negotiate, S};
+idle_wait({accept_negotiate, OtherPid}, S=#state{other=OtherPid}) ->
+  gen_fsm:reply(S#state.from, ok),
+  notice(S, "starting negotiation", []),
+  {next_state, negotiate, S};
+idle_wait(Event, Data) ->
+  unexpected(Event, idle_wait),
+  {next_state, idle_wait, Data}.
+add(Item, Items) ->
+  [Item | Items].
 remove(Item, Items) ->
   Items -- [Item].
 
@@ -101,7 +112,7 @@ negotiate({make_offer, Item}, S = #state{ownitems = OwnItems}) ->
   do_offer(S#state.other, Item),
   notice(S, "offering ~p", [Item]),
   {next_state, negotiate, S#state{ownitems = add(Item, OwnItems)}};
-negotiate({retract_offer, Item}, S = #state{ownitems = add(Item, OwnItems)}) ->
+negotiate({retract_offer, Item}, S = #state{ownitems = OwnItems}) ->
   undo_offer(S#state.other, Item),
   notice(S, "cancelling offer on ~p", [Item]),
   {next_state, negotiate, S#state{ownitems = remove(Item, OwnItems)}};
@@ -154,10 +165,9 @@ wait('ready!', S = #state{}) ->
 wait(Event, Data) ->
   unexpected(Event, wait),
   {next_state, wait, Data}.
-ready(ack, S=#state{}) ->
-priority(OwnPid, OtherPid) when OwnPid > OtherPid ->
-  true;
-priority(OwnPid, otherPid) when OwnPid < OtherPid ->
+priority(OwnPid, OtherPid) 
+  when OwnPid > OtherPid -> true;
+priority(OwnPid, OtherPid) when OwnPid < OtherPid ->
   false.
 ready(ack, S=#state{}) ->
   case priority(self(), S#state.other) of
@@ -179,7 +189,7 @@ ready(ack, S=#state{}) ->
   end;
 ready(Event, Data) ->
     unexpected(Event, ready),
-    {next_state, ready, Data};
+    {next_state, ready, Data}.
 ready(ask_commit, _From, S) ->
   notice(S, "replying to ask_commit", []),
   {reply, ready_commit, ready, S};
@@ -190,3 +200,34 @@ ready(do_commit, _From, S) ->
 ready(Event, _From, Data) ->
   unexpected(Event, ready),
   {next_state, ready, Data}.
+commit(S = #state{}) ->
+  io:format("Transaction completed for ~s. "
+            "Items send are:~n~p, ~n received are:~n~p.~n"
+            "This operation should have some atomic save "
+            "in a database. ~n",
+            [S#state.name, S#state.ownitems, S#state.otheritems]).
+handle_event(cancel, _StateName, S=#state{}) ->
+  notice(S, "received cance event", []),
+  {stop, other_cancelled, S};
+handle_event(Event, StateName, Data) ->
+  unexpected(Event, StateName),
+  {next_state, StateName, Data}.
+handle_sync_event(cancel, _From, _StateName, S = #state{}) ->
+  notify_cancel(S#state.other),
+  notice(S, "cancelling trade, sending cancel event", []),
+  {stop, cancelled, ok, S};
+handle_sync_event(Event, _From, StateName, Data) ->
+  unexpected(Event, StateName),
+  {next_state, StateName, Data}.
+handle_info({'DOWN', Ref, process, Pid, Reason}, _, S=#state{other=Pid, monitor=Ref}) ->
+  notice(S, "Other side dead", []),
+  {stop, {other_down, Reason}, S};
+handle_info(Info, StateName, Data) ->
+  unexpected(Info, StateName),
+  {next_state, StateName, Data}.
+code_change(_OldVsn, StateName, Data, _Extra) ->
+  {ok, StateName, Data}.
+terminate(normal, ready, S=#state{}) ->
+  notice(S, "FSM leaving.", []);
+terminate(_Reason, _StateName, _StateData) ->
+  ok.
